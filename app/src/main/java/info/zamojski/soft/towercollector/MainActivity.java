@@ -86,6 +86,7 @@ import info.zamojski.soft.towercollector.enums.Validity;
 import info.zamojski.soft.towercollector.events.AirplaneModeChangedEvent;
 import info.zamojski.soft.towercollector.events.BatteryOptimizationsChangedEvent;
 import info.zamojski.soft.towercollector.events.CollectorStartedEvent;
+import info.zamojski.soft.towercollector.events.CollectorStateChangedEvent;
 import info.zamojski.soft.towercollector.events.GpsStatusChangedEvent;
 import info.zamojski.soft.towercollector.events.MapEnabledChangedEvent;
 import info.zamojski.soft.towercollector.events.PowerSaveModeChangedEvent;
@@ -146,6 +147,7 @@ public class MainActivity extends AppCompatActivity
 
     private UploaderProgressDialogFragment uploaderProgressDialog;
 
+    private boolean stopCollectingAutoFlowStartWhenCollectorStops;
     private boolean stopCollectingAutoFlowInProgress;
 
     private Boolean canStartNetworkTypeSystemActivityResult = null;
@@ -1006,7 +1008,22 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void stopCollectorServiceWithAutoActions() {
+        stopCollectingAutoFlowStartWhenCollectorStops = true;
         stopCollectorService();
+
+        // stopService() is async; wait for CollectorService to fully stop before kicking off
+        // export/upload, otherwise the app will report "Stop 'Collector service' first."
+        tryStartStopCollectingAutoFlowIfCollectorStopped();
+    }
+
+    private void tryStartStopCollectingAutoFlowIfCollectorStopped() {
+        if (!stopCollectingAutoFlowStartWhenCollectorStops) {
+            return;
+        }
+        if (MyApplication.isBackgroundTaskRunning(CollectorService.class)) {
+            return;
+        }
+        stopCollectingAutoFlowStartWhenCollectorStops = false;
         startStopCollectingAutoFlowWithCheck();
     }
 
@@ -1037,6 +1054,7 @@ public class MainActivity extends AppCompatActivity
     }
 
     private void resetStopCollectingAutoFlow() {
+        stopCollectingAutoFlowStartWhenCollectorStops = false;
         stopCollectingAutoFlowInProgress = false;
         exportedDirAbsolutePath = null;
         exportedFilePaths = null;
@@ -1981,6 +1999,13 @@ public class MainActivity extends AppCompatActivity
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onEvent(CollectorStartedEvent event) {
         bindService(event.getIntent(), collectorServiceConnection, 0);
+    }
+
+    @Subscribe(threadMode = ThreadMode.MAIN, sticky = true)
+    public void onEvent(CollectorStateChangedEvent event) {
+        if (!event.isActive()) {
+            tryStartStopCollectingAutoFlowIfCollectorStopped();
+        }
     }
 
     @Subscribe(threadMode = ThreadMode.MAIN, sticky = true)
