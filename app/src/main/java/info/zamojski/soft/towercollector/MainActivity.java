@@ -146,6 +146,8 @@ public class MainActivity extends AppCompatActivity
 
     private UploaderProgressDialogFragment uploaderProgressDialog;
 
+    private boolean stopCollectingAutoFlowInProgress;
+
     private Boolean canStartNetworkTypeSystemActivityResult = null;
 
     private Menu mainMenu;
@@ -325,7 +327,7 @@ public class MainActivity extends AppCompatActivity
             startCollectorServiceWithCheck();
             return true;
         } else if (itemId == R.id.main_menu_stop) {
-            stopCollectorService();
+            stopCollectorServiceWithAutoActions();
             return true;
         } else if (itemId == R.id.main_menu_upload) {
             startUploaderTaskWithCheck();
@@ -873,7 +875,11 @@ public class MainActivity extends AppCompatActivity
         shareIntent.setType(calculatedMimeType);
         Intent intent = shareIntent.getIntent();
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-        startActivity(Intent.createChooser(intent, null));
+        try {
+            startActivity(Intent.createChooser(intent, null));
+        } catch (Exception ex) {
+            Toast.makeText(getApplication(), R.string.system_toast_no_handler_for_operation, Toast.LENGTH_LONG).show();
+        }
     }
 
     // ========== MENU START/STOP METHODS ========== //
@@ -997,6 +1003,203 @@ public class MainActivity extends AppCompatActivity
     private void stopCollectorService() {
         stopService(new Intent(this, CollectorService.class));
         ApkUtils.reportShortcutUsage(MyApplication.getApplication(), R.string.shortcut_id_collector_toggle);
+    }
+
+    private void stopCollectorServiceWithAutoActions() {
+        stopCollectorService();
+        startStopCollectingAutoFlowWithCheck();
+    }
+
+    private void startStopCollectingAutoFlowWithCheck() {
+        String runningTaskClassName = MyApplication.getBackgroundTaskName();
+        if (runningTaskClassName != null) {
+            Timber.d("startStopCollectingAutoFlowWithCheck(): Another task is running in background: %s", runningTaskClassName);
+            backgroundTaskHelper.showTaskRunningMessage(runningTaskClassName);
+            return;
+        }
+
+        if (PermissionUtils.isNotificationPermissionRequired()) {
+            MainActivityPermissionsDispatcher.startStopCollectingAutoFlowInternalApi33WithPermissionCheck(MainActivity.this);
+        } else {
+            startStopCollectingAutoFlowInternal();
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    @NeedsPermission({Manifest.permission.POST_NOTIFICATIONS})
+    void startStopCollectingAutoFlowInternalApi33() {
+        startStopCollectingAutoFlowInternal();
+    }
+
+    private void startStopCollectingAutoFlowInternal() {
+        stopCollectingAutoFlowInProgress = true;
+        startStopCollectingExportCsv();
+    }
+
+    private void resetStopCollectingAutoFlow() {
+        stopCollectingAutoFlowInProgress = false;
+        exportedDirAbsolutePath = null;
+        exportedFilePaths = null;
+    }
+
+    private void startStopCollectingExportCsv() {
+        Uri storageUri = MyApplication.getPreferencesProvider().getStorageUri();
+        if (!StorageUtils.canWriteStorageUri(storageUri)) {
+            StorageUtils.requestStorageUri(this);
+            resetStopCollectingAutoFlow();
+            return;
+        }
+
+        List<FileType> selectedFileTypes = new ArrayList<>();
+        selectedFileTypes.add(FileType.Csv);
+        if (MyApplication.getPreferencesProvider().getEnabledExportFileTypes().contains(FileType.Compress)) {
+            selectedFileTypes.add(FileType.Compress);
+        }
+        WorkRequest exportWorkRequest = new OneTimeWorkRequest.Builder(ExportWorker.class)
+                .setInputData(new Data.Builder()
+                        .putStringArray(ExportWorker.SELECTED_FILE_TYPES, FileType.toNames(selectedFileTypes).toArray(new String[0]))
+                        .putString(ExportWorker.INTENT_SOURCE, IntentSource.User.name())
+                        .build())
+                .addTag(ExportWorker.WORKER_TAG)
+                .build();
+        showStopCollectingExportProgress(storageUri, exportWorkRequest.getId());
+        WorkManager.getInstance(MyApplication.getApplication())
+                .enqueue(exportWorkRequest);
+    }
+
+    private void showStopCollectingExportProgress(Uri storageUri, UUID workId) {
+        WorkManager.getInstance(MyApplication.getApplication())
+                .getWorkInfoByIdLiveData(workId)
+                .observe(this, new Observer<WorkInfo>() {
+                    private final String INNER_TAG = MainActivity.class.getSimpleName() + ".StopCollectingAutoExport";
+
+                    @Override
+                    public void onChanged(WorkInfo workInfo) {
+                        if (workInfo == null) {
+                            Timber.tag(INNER_TAG).w("onChanged(): WorkInfo is null");
+                            if (exportProgressDialog != null) {
+                                exportProgressDialog.dismiss();
+                            }
+                            exportProgressDialog = null;
+                            resetStopCollectingAutoFlow();
+                            return;
+                        }
+                        int currentPercent = workInfo.getProgress().getInt(ExportWorker.PROGRESS, ExportWorker.PROGRESS_MIN_VALUE);
+                        int maxPercent = workInfo.getProgress().getInt(ExportWorker.PROGRESS_MAX, ExportWorker.PROGRESS_MAX_VALUE);
+                        Timber.tag(INNER_TAG).d("onChanged(): Updating progress: %s %s", currentPercent, maxPercent);
+                        if (exportProgressDialog == null) {
+                            exportProgressDialog = ExportProgressDialogFragment.createInstance(storageUri, currentPercent, maxPercent);
+                            exportProgressDialog.setCancelListener(MainActivity.this);
+                            exportProgressDialog.show(getSupportFragmentManager(), ExportProgressDialogFragment.FRAGMENT_TAG);
+                        } else {
+                            currentPercent = Math.min(currentPercent, maxPercent);
+                            exportProgressDialog.setProgress(currentPercent);
+                        }
+                        if (workInfo.getState().isFinished()) {
+                            exportProgressDialog.dismiss();
+                            exportProgressDialog = null;
+                            onStopCollectingExportFinished(workInfo);
+                        }
+                    }
+                });
+    }
+
+    private void onStopCollectingExportFinished(WorkInfo workInfo) {
+        if (workInfo.getState() == WorkInfo.State.SUCCEEDED) {
+            exportedDirAbsolutePath = workInfo.getOutputData().getString(ExportWorker.DIR_PATH);
+            exportedFilePaths = workInfo.getOutputData().getStringArray(ExportWorker.FILE_PATHS);
+            startStopCollectingUploader();
+        } else if (workInfo.getState() == WorkInfo.State.CANCELLED) {
+            Toast.makeText(MainActivity.this, R.string.export_toast_cancelled, Toast.LENGTH_LONG).show();
+            resetStopCollectingAutoFlow();
+        } else {
+            Toast.makeText(MainActivity.this, workInfo.getOutputData().getString(ExportWorker.MESSAGE), Toast.LENGTH_LONG).show();
+            resetStopCollectingAutoFlow();
+        }
+        WorkManager.getInstance(MyApplication.getApplication()).pruneWork();
+    }
+
+    private void startStopCollectingUploader() {
+        if (!NetworkUtils.isNetworkAvailable(MyApplication.getApplication())) {
+            Toast.makeText(MainActivity.this, R.string.uploader_no_internet_message, Toast.LENGTH_LONG).show();
+            showStopCollectingShareChooser();
+            return;
+        }
+
+        final PreferencesProvider preferencesProvider = MyApplication.getPreferencesProvider();
+        final boolean isUseSharedOpenCellIdApiKeyEnabled = preferencesProvider.isUseSharedOpenCellIdApiKeyEnabled();
+        final boolean isCustomMlsUploadEnabled = preferencesProvider.isCustomMlsUploadEnabled();
+        final boolean isReuploadIfUploadFailsEnabled = preferencesProvider.isReuploadIfUploadFailsEnabled();
+
+        WorkRequest uploaderWorkRequest = new OneTimeWorkRequest.Builder(UploaderWorker.class)
+                .setInputData(new Data.Builder()
+                        .putBoolean(UploaderWorker.INTENT_KEY_UPLOAD_TO_OCID, true)
+                        .putBoolean(UploaderWorker.INTENT_KEY_UPLOAD_TO_OCID_SHARED, isUseSharedOpenCellIdApiKeyEnabled)
+                        .putBoolean(UploaderWorker.INTENT_KEY_UPLOAD_TO_MLS, true)
+                        .putBoolean(UploaderWorker.INTENT_KEY_UPLOAD_TO_CUSTOM_MLS, isCustomMlsUploadEnabled)
+                        .putBoolean(UploaderWorker.INTENT_KEY_UPLOAD_TRY_REUPLOAD, isReuploadIfUploadFailsEnabled)
+                        .putString(UploaderWorker.INTENT_KEY_START_INTENT_SOURCE, IntentSource.User.name())
+                        .build())
+                .addTag(UploaderWorker.WORKER_TAG)
+                .build();
+        showStopCollectingUploaderProgress(uploaderWorkRequest.getId());
+        WorkManager.getInstance(MyApplication.getApplication())
+                .enqueue(uploaderWorkRequest);
+        ApkUtils.reportShortcutUsage(MyApplication.getApplication(), R.string.shortcut_id_uploader_toggle);
+    }
+
+    private void showStopCollectingUploaderProgress(UUID workId) {
+        WorkManager.getInstance(MyApplication.getApplication())
+                .getWorkInfoByIdLiveData(workId)
+                .observe(this, new Observer<WorkInfo>() {
+                    private final String INNER_TAG = MainActivity.class.getSimpleName() + ".StopCollectingAutoUpload";
+
+                    @Override
+                    public void onChanged(WorkInfo workInfo) {
+                        if (workInfo == null) {
+                            Timber.tag(INNER_TAG).w("onChanged(): WorkInfo is null");
+                            if (uploaderProgressDialog != null) {
+                                uploaderProgressDialog.dismiss();
+                            }
+                            uploaderProgressDialog = null;
+                            resetStopCollectingAutoFlow();
+                            return;
+                        }
+                        int currentPercent = workInfo.getProgress().getInt(UploaderWorker.PROGRESS, UploaderWorker.PROGRESS_MIN_VALUE);
+                        int maxPercent = workInfo.getProgress().getInt(UploaderWorker.PROGRESS_MAX, UploaderWorker.PROGRESS_MAX_VALUE);
+                        Timber.tag(INNER_TAG).d("onChanged(): Updating progress: %s %s", currentPercent, maxPercent);
+                        if (uploaderProgressDialog == null) {
+                            uploaderProgressDialog = UploaderProgressDialogFragment.createInstance(currentPercent, maxPercent);
+                            uploaderProgressDialog.setCancelListener(MainActivity.this);
+                            uploaderProgressDialog.show(getSupportFragmentManager(), UploaderProgressDialogFragment.FRAGMENT_TAG);
+                        } else {
+                            currentPercent = Math.min(currentPercent, maxPercent);
+                            uploaderProgressDialog.setProgress(currentPercent);
+                        }
+                        if (workInfo.getState().isFinished()) {
+                            uploaderProgressDialog.dismiss();
+                            uploaderProgressDialog = null;
+                            onStopCollectingUploaderFinished(workInfo);
+                        }
+                    }
+                });
+    }
+
+    private void onStopCollectingUploaderFinished(WorkInfo workInfo) {
+        String message = workInfo.getOutputData().getString(UploaderWorker.MESSAGE);
+        if (message != null && !message.isEmpty()) {
+            Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+        }
+        WorkManager.getInstance(MyApplication.getApplication()).pruneWork();
+        showStopCollectingShareChooser();
+    }
+
+    private void showStopCollectingShareChooser() {
+        try {
+            exportShareAction();
+        } finally {
+            resetStopCollectingAutoFlow();
+        }
     }
 
     private void startUploaderTaskWithCheck() {
@@ -1475,12 +1678,18 @@ public class MainActivity extends AppCompatActivity
     public void onExportCancelled() {
         cancelExport();
         exportProgressDialog = null;
+        if (stopCollectingAutoFlowInProgress) {
+            resetStopCollectingAutoFlow();
+        }
     }
 
     @Override
     public void onUploadCancelled() {
         cancelUploader();
         uploaderProgressDialog = null;
+        if (stopCollectingAutoFlowInProgress) {
+            resetStopCollectingAutoFlow();
+        }
     }
 
     private void startCleanup() {
